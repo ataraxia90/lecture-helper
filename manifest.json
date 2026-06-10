@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Lecture Helper",
+  "description": "Target-site lecture attendance helper that opens unfinished lesson popups for the remaining required time.",
+  "version": "1.0.0",
+  "permissions": ["storage", "tabs", "windows", "scripting", "debugger"],
+  "host_permissions": ["https://moip.nhi.go.kr/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Lecture Helper"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://moip.nhi.go.kr/*"],
+      "js": ["config.js", "utils.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

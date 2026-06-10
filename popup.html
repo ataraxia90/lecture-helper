@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lecture Helper</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <h1>Lecture Helper</h1>
+        <span id="status" class="status">idle</span>
+      </header>
+
+      <section class="controls">
+        <button id="startBtn" type="button">Start</button>
+        <button id="stopBtn" type="button">Stop</button>
+      </section>
+
+      <section class="details">
+        <div class="field">
+          <span class="label">차시명</span>
+          <span id="currentTitle" class="value muted">-</span>
+        </div>
+        <div class="timeGrid">
+          <div>
+            <span class="label">completed</span>
+            <strong id="completedTime">0:00</strong>
+          </div>
+          <div>
+            <span class="label">total</span>
+            <strong id="totalTime">0:00</strong>
+          </div>
+          <div>
+            <span class="label">remaining</span>
+            <strong id="remainingTime">0:00</strong>
+          </div>
+        </div>
+        <div class="field">
+          <span class="label">마지막 오류</span>
+          <span id="lastError" class="value errorText">-</span>
+        </div>
+      </section>
+    </main>
+    <script src="utils.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

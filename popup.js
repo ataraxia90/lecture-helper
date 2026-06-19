@@ -2,6 +2,7 @@ const Utils = globalThis.LectureHelperUtils;
 
 const elements = {
   status: document.getElementById("status"),
+  courseTitle: document.getElementById("courseTitle"),
   currentTitle: document.getElementById("currentTitle"),
   completedTime: document.getElementById("completedTime"),
   totalTime: document.getElementById("totalTime"),
@@ -18,7 +19,8 @@ function sendMessage(message) {
 function render(state) {
   const safe = state || {};
   elements.status.textContent = safe.status || "idle";
-  elements.currentTitle.textContent = safe.currentTitle || "-";
+  elements.courseTitle.textContent = Utils.formatIndexedLabel(safe.courseTitle, safe.courseIndex, safe.courseTotal);
+  elements.currentTitle.textContent = Utils.formatIndexedLabel(safe.currentTitle, safe.lessonIndex, safe.lessonTotal);
   elements.completedTime.textContent = Utils.formatDuration(safe.completedTime || 0);
   elements.totalTime.textContent = Utils.formatDuration(safe.totalTime || 0);
   elements.remainingTime.textContent = Utils.formatDuration(safe.remainingTime || 0);

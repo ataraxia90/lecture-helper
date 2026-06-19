@@ -8,7 +8,13 @@ const defaultState = {
   status: "idle",
   running: false,
   tabId: null,
+  courseTitle: "",
+  courseIndex: 0,
+  courseTotal: 0,
+  courseQueue: [],
   currentTitle: "",
+  lessonIndex: 0,
+  lessonTotal: 0,
   completedTime: 0,
   totalTime: 0,
   remainingTime: 0,
@@ -27,6 +33,17 @@ async function setState(patch) {
   const next = { ...(await getState()), ...patch, updatedAt: Date.now() };
   await chrome.storage.local.set({ [STATE_KEY]: next });
   return next;
+}
+
+function allowTargetPopups() {
+  if (!chrome.contentSettings || !chrome.contentSettings.popups) return Promise.resolve(false);
+
+  return new Promise((resolve) => {
+    chrome.contentSettings.popups.set({
+      primaryPattern: "https://moip.nhi.go.kr/*",
+      setting: "allow"
+    }, () => resolve(!chrome.runtime.lastError));
+  });
 }
 
 async function getActiveTab() {
@@ -50,23 +67,28 @@ async function findLectureFrame(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     func: () => {
-      const rowsFromList = Array.from(document.querySelectorAll(".study_group .list_area .list_clear, .list_area .list_clear, .list_clear"))
-        .filter((row) => row.querySelector(".subject a") && row.querySelector(".progress, .current, .total"));
+      const rowsFromList = Array.from(document.querySelectorAll(".study_group .list_area .list_clear, .study_group .list_area .list.clear, .list_area .list_clear, .list_area .list.clear, .list_clear, .list.clear"))
+        .filter((row) => row.querySelector(".subject a, a[onclick*='checkRtprgs'], button[onclick*='checkRtprgs']") && row.querySelector(".progress, .current, .total"));
       const rowsFromTime = Array.from(document.querySelectorAll(".progress .current, .progress .total, span.current, span.total, [class*='current'], [class*='total']"))
-        .map((node) => node.closest(".list_clear"))
-        .filter((row) => row && row.querySelector(".subject a"));
+        .map((node) => node.closest(".list_clear, .list.clear"))
+        .filter((row) => row && row.querySelector(".subject a, a[onclick*='checkRtprgs'], button[onclick*='checkRtprgs']"));
       const rows = Array.from(new Set([...rowsFromList, ...rowsFromTime]));
       const text = document.body ? document.body.innerText || "" : "";
       const progressCount = document.querySelectorAll(".progress").length;
       const currentCount = document.querySelectorAll(".current, [class*='current']").length;
       const totalCount = document.querySelectorAll(".total, [class*='total']").length;
+      const hasLessonSignals = rows.some((row) => {
+        return row.querySelector(".subject a, a[onclick*='checkTrRng'], button[onclick*='checkTrRng'], a[onclick*='checkRtprgs'], button[onclick*='checkRtprgs']");
+      });
       return {
         rowCount: rows.length,
-        score: rows.length * 100 + progressCount * 10 + currentCount * 10 + totalCount * 10 + (/00:\d{2}:\d{2}|보고듣고말하기/.test(text) ? 1 : 0),
-        title: rows[0]?.querySelector(".subject a")?.innerText?.trim() || "",
+        score: hasLessonSignals
+          ? rows.length * 100 + progressCount * 10 + currentCount * 10 + totalCount * 10 + (/00:\d{2}:\d{2}|보고듣고말하기/.test(text) ? 1 : 0)
+          : 0,
+        title: rows[0]?.querySelector(".subject a, a[onclick*='checkRtprgs']")?.innerText?.trim() || "",
         url: location.href,
         diagnostics: {
-          listClear: document.querySelectorAll(".list_clear").length,
+          listClear: document.querySelectorAll(".list_clear, .list.clear").length,
           subjectLinks: document.querySelectorAll(".subject a").length,
           progress: progressCount,
           current: currentCount,
@@ -161,31 +183,82 @@ async function findCourseFrame(tabId) {
   return { frameId: null, diagnostics };
 }
 
-async function startAutomation() {
-  const tab = await getActiveTab();
+async function findCourseDetailFrame(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => {
+      const startLinks = Array.from(document.querySelectorAll("a[onclick*='onStartNavi'], button[onclick*='onStartNavi']"));
+      const text = document.body ? document.body.innerText || "" : "";
+      const hasCourseDetail = /학습현황|수료기준|필수학습시간|인정시간/.test(text) || startLinks.length > 0;
+      return {
+        startCount: startLinks.length,
+        score: startLinks.length > 0 ? startLinks.length * 1000 : 0,
+        title: document.title,
+        diagnostics: {
+          hasCourseDetail,
+          startCount: startLinks.length
+        }
+      };
+    }
+  });
+
+  const found = results
+    .filter((result) => result.result && result.result.score > 0)
+    .sort((a, b) => b.result.score - a.result.score)[0] || null;
+  if (found) return found;
+
+  const diagnostics = results
+    .map((result) => {
+      const data = result.result || {};
+      const diag = data.diagnostics || {};
+      return `frame=${result.frameId} detail=${diag.hasCourseDetail ? "Y" : "N"} start=${diag.startCount || 0}`;
+    })
+    .join(" | ");
+  return { frameId: null, diagnostics };
+}
+
+async function startAutomation(senderTab = null) {
+  const tab = senderTab && senderTab.id != null ? senderTab : await getActiveTab();
   if (!tab || !Utils.isTargetUrl(tab.url)) {
     const allowed = CONFIG.TARGET_HOSTS.join(", ");
     throw new Error(`대상 강의 목록 페이지가 아닙니다. 허용 도메인: ${allowed}`);
   }
 
   await ensureContentScripts(tab.id);
-  const lectureFrame = await findLectureFrame(tab.id);
+  await allowTargetPopups();
   await setState({
     status: "running",
     running: true,
     tabId: tab.id,
+    courseTitle: "",
+    courseIndex: 0,
+    courseTotal: 0,
+    courseQueue: [],
     currentTitle: "",
+    lessonIndex: 0,
+    lessonTotal: 0,
     completedTime: 0,
     totalTime: 0,
     remainingTime: 0,
     lastError: ""
   });
 
+  const lectureFrame = await findLectureFrame(tab.id);
   if (lectureFrame && lectureFrame.frameId != null) {
     await chrome.tabs.sendMessage(
       tab.id,
       { type: "START_AUTOMATION" },
       { frameId: lectureFrame.frameId }
+    );
+    return;
+  }
+
+  const courseDetailFrame = await findCourseDetailFrame(tab.id);
+  if (courseDetailFrame && courseDetailFrame.frameId != null) {
+    await chrome.tabs.sendMessage(
+      tab.id,
+      { type: "START_AUTOMATION" },
+      { frameId: courseDetailFrame.frameId }
     );
     return;
   }
@@ -243,6 +316,63 @@ async function preparePopupTracking(senderTabId) {
   });
 }
 
+async function autoAcceptDialogs(tabId, durationMs = 30000) {
+  if (tabId == null) return { attached: false, reason: "missing_tab" };
+
+  const target = { tabId };
+  let attached = false;
+  let listener = null;
+
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await chrome.debugger.sendCommand(target, "Page.enable");
+
+    listener = async (source, method, params) => {
+      if (source.tabId !== tabId || method !== "Page.javascriptDialogOpening") return;
+      const message = String(params && params.message || "");
+      const shouldAccept = /이전에\s*학습하신\s*곳으로\s*이동|previous/i.test(message)
+        || params.type === "confirm"
+        || params.type === "alert";
+      if (!shouldAccept) return;
+
+      try {
+        await chrome.debugger.sendCommand(target, "Page.handleJavaScriptDialog", { accept: true });
+      } catch (_error) {
+        // The dialog may already have been handled by the page or user.
+      }
+    };
+    chrome.debugger.onEvent.addListener(listener);
+
+    try {
+      await chrome.debugger.sendCommand(target, "Page.handleJavaScriptDialog", { accept: true });
+    } catch (_error) {
+      // No dialog is currently open; future Page.javascriptDialogOpening events are handled above.
+    }
+
+    setTimeout(async () => {
+      if (listener) chrome.debugger.onEvent.removeListener(listener);
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_error) {
+        // The popup may already be closed.
+      }
+    }, durationMs);
+
+    return { attached: true };
+  } catch (error) {
+    if (listener) chrome.debugger.onEvent.removeListener(listener);
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_detachError) {
+        // Ignore detach failures after attach errors.
+      }
+    }
+    return { attached: false, reason: error.message };
+  }
+}
+
 async function detectPopup(senderTabId) {
   const tracker = popupTrackers.get(senderTabId);
   if (!tracker) return null;
@@ -264,7 +394,12 @@ async function detectPopup(senderTabId) {
     if (newPopupWindow || newTab) {
       tracker.popupWindowId = newPopupWindow ? newPopupWindow.id : null;
       tracker.popupTabId = newTab ? newTab.id : null;
+      if (!tracker.popupTabId && tracker.popupWindowId != null) {
+        const popupTabs = await chrome.tabs.query({ windowId: tracker.popupWindowId });
+        tracker.popupTabId = popupTabs[0]?.id || null;
+      }
       popupTrackers.set(senderTabId, tracker);
+      if (tracker.popupTabId != null) autoAcceptDialogs(tracker.popupTabId);
       return {
         windowId: tracker.popupWindowId,
         tabId: tracker.popupTabId
@@ -314,6 +449,51 @@ async function closeTabWithDialogHandling(tabId) {
   }
 }
 
+async function dispatchMouseClickOnTab(tabId, point) {
+  if (tabId == null || !point) return { clicked: false, reason: "missing_target" };
+
+  const target = { tabId };
+  let attached = false;
+  try {
+    await chrome.debugger.attach(target, "1.3");
+    attached = true;
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: point.x,
+      y: point.y,
+      button: "none"
+    });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: point.x,
+      y: point.y,
+      button: "left",
+      clickCount: 1
+    });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: point.x,
+      y: point.y,
+      button: "left",
+      clickCount: 1
+    });
+    return { clicked: true };
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(target);
+      } catch (_error) {
+        // The tab may have navigated or closed.
+      }
+    }
+  }
+}
+
+async function dispatchMouseClick(sender, point) {
+  if (!sender.tab || sender.tab.id == null) return { clicked: false, reason: "missing_target" };
+  return dispatchMouseClickOnTab(sender.tab.id, point);
+}
+
 async function closeTrackedPopup(senderTabId) {
   const tracker = popupTrackers.get(senderTabId);
   if (!tracker) return { closed: false, reason: "no_tracker" };
@@ -353,6 +533,11 @@ async function runPageOnclick(sender, onclick) {
     target,
     world: "MAIN",
     func: (onclickText) => {
+      const clearBrokenCoursePopupHandle = (hostWindow) => {
+        if (!hostWindow || !hostWindow.contWin) return;
+        hostWindow.contWin = null;
+      };
+
       const call = String(onclickText || "").match(/(?:return\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*\(([\s\S]*?)\)/);
       if (!call) return false;
 
@@ -379,7 +564,22 @@ async function runPageOnclick(sender, onclick) {
         else if (typeof window[fnName] === "function") owner = window;
         else return false;
       }
-      owner[fnName](...args);
+      clearBrokenCoursePopupHandle(owner);
+      const originalAlert = owner.alert;
+      const originalConfirm = owner.confirm;
+      owner.alert = () => undefined;
+      owner.confirm = () => true;
+      const restoreDialogs = () => {
+        if (owner.alert === originalAlert || owner.alert.toString().includes("undefined")) owner.alert = originalAlert;
+        if (owner.confirm === originalConfirm || owner.confirm.toString().includes("true")) owner.confirm = originalConfirm;
+      };
+      try {
+        owner[fnName](...args);
+        owner.setTimeout(restoreDialogs, 5000);
+      } catch (error) {
+        restoreDialogs();
+        throw error;
+      }
       return true;
     },
     args: [onclick]
@@ -388,8 +588,273 @@ async function runPageOnclick(sender, onclick) {
   return { executed: Boolean(result && result.result) };
 }
 
+function normalizeLessonOnclick(onclick) {
+  return String(onclick || "")
+    .replace(/^\s*javascript:\s*/i, "")
+    .replace(/^\s*return\s+/i, "")
+    .replace(/^\s*parent\./, "")
+    .replace(/;?\s*$/, ";");
+}
+
+async function waitForTabSettled(tabId, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === "complete") return true;
+    } catch (_error) {
+      return false;
+    }
+    await Utils.sleep(250);
+  }
+  return false;
+}
+
+async function createLessonClickPoint(tabId, onclick, frameId = null) {
+  const target = { tabId };
+  if (frameId != null) target.frameIds = [frameId];
+
+  const [result] = await chrome.scripting.executeScript({
+    target,
+    world: "MAIN",
+    func: (onclickText) => {
+      const originalCall = String(onclickText || "").replace(/^\s*javascript:\s*/i, "").replace(/;?\s*$/, ";");
+      const localCall = originalCall.replace(/^\s*return\s+/i, "").replace(/^\s*parent\./, "");
+      const call = localCall.match(/([A-Za-z_$][\w$]*)\s*\(/);
+      const fnName = call && call[1];
+      const hasLocalRunner = Boolean(fnName && typeof window[fnName] === "function");
+      const hasParentRunner = Boolean(fnName && window.parent && window.parent !== window && typeof window.parent[fnName] === "function");
+
+      if (!hasLocalRunner && !hasParentRunner) {
+        if (/\/study\/grade\/elrnGradeView\.do/i.test(location.pathname) && history.length > 1) {
+          history.back();
+          return { navigated: true, url: location.href };
+        }
+        return { ready: false, reason: "lesson_runner_not_found", url: location.href, fnName };
+      }
+
+      const clickCall = hasLocalRunner ? localCall : originalCall;
+      try {
+        const host = hasLocalRunner ? window : window.parent;
+        if (host && "contWin" in host) host.contWin = null;
+      } catch (_error) {
+        // Ignore stale or read-only popup handles.
+      }
+
+      let button = document.getElementById("lecture-helper-trusted-lesson-click");
+      if (!button) {
+        button = document.createElement("button");
+        button.id = "lecture-helper-trusted-lesson-click";
+        button.textContent = "LH";
+        Object.assign(button.style, {
+          position: "fixed",
+          left: "24px",
+          top: "24px",
+          zIndex: 2147483647,
+          width: "72px",
+          height: "36px",
+          opacity: "0.01",
+          pointerEvents: "auto"
+        });
+        document.documentElement.appendChild(button);
+      }
+      button.setAttribute("onclick", clickCall);
+      const rect = button.getBoundingClientRect();
+      let x = rect.left + rect.width / 2;
+      let y = rect.top + rect.height / 2;
+      let win = window;
+      while (win.parent && win.parent !== win) {
+        try {
+          const frame = win.frameElement;
+          if (!frame) break;
+          const frameRect = frame.getBoundingClientRect();
+          x += frameRect.left;
+          y += frameRect.top;
+          win = win.parent;
+        } catch (_error) {
+          break;
+        }
+      }
+      return { ready: true, point: { x, y }, url: location.href, fnName };
+    },
+    args: [onclick]
+  });
+
+  return result && result.result ? result.result : { ready: false, reason: "no_script_result" };
+}
+
+async function openLessonWithTrustedClick(sender, onclick) {
+  if (!sender.tab || sender.tab.id == null || !onclick) return { popup: null, clicked: false, reason: "missing_sender_or_onclick" };
+
+  const tabId = sender.tab.id;
+  await preparePopupTracking(tabId);
+  await clearPagePopupHandle(sender);
+
+  let pointResult = await createLessonClickPoint(tabId, normalizeLessonOnclick(onclick), sender.frameId ?? null);
+  if (pointResult && pointResult.navigated) {
+    await waitForTabSettled(tabId);
+    await Utils.sleep(1000);
+    pointResult = await createLessonClickPoint(tabId, normalizeLessonOnclick(onclick), null);
+  }
+
+  if (!pointResult || !pointResult.ready || !pointResult.point) {
+    return { popup: null, clicked: false, reason: pointResult?.reason || "click_point_not_ready", diagnostics: pointResult };
+  }
+
+  const clickResult = await dispatchMouseClickOnTab(tabId, pointResult.point);
+  if (!clickResult.clicked) return { popup: null, clicked: false, reason: clickResult.reason || "debugger_click_failed" };
+
+  return { popup: await detectPopup(tabId), clicked: true, diagnostics: pointResult };
+}
+
+async function clearPagePopupHandle(sender) {
+  if (!sender.tab || sender.tab.id == null) return { cleared: false };
+
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: sender.tab.id, allFrames: true },
+    world: "MAIN",
+    func: () => {
+      let cleared = 0;
+      try {
+        if ("contWin" in window) {
+          window.contWin = null;
+          cleared += 1;
+        }
+      } catch (_error) {
+        // Ignore pages where the handle is not writable.
+      }
+      try {
+        if (window.parent && window.parent !== window && "contWin" in window.parent) {
+          window.parent.contWin = null;
+          cleared += 1;
+        }
+      } catch (_error) {
+        // Ignore cross-frame access issues.
+      }
+      return cleared;
+    }
+  });
+
+  return { cleared: Boolean(result && result.result) };
+}
+
+function parseOnclickArgs(onclick) {
+  const call = String(onclick || "").match(/(?:return\s+)?(?:parent\.)?([A-Za-z_$][\w$]*)\s*\(([\s\S]*?)\)/);
+  if (!call) return null;
+
+  const args = [];
+  const argRegex = /'([^']*)'|"([^"]*)"|([^,\s)]+)/g;
+  let match;
+  while ((match = argRegex.exec(call[2])) !== null) {
+    args.push(match[1] ?? match[2] ?? match[3] ?? "");
+  }
+  return { name: call[1], args };
+}
+
+async function openLearningPopup(sender, onclick) {
+  if (!sender.tab || sender.tab.id == null || !onclick) return { opened: false, reason: "missing_sender_or_onclick" };
+
+  const parsed = parseOnclickArgs(onclick);
+  if (!parsed || !["checkRtprgs", "onStartNavi"].includes(parsed.name)) {
+    return { opened: false, reason: "unsupported_onclick" };
+  }
+
+  const target = { tabId: sender.tab.id };
+  if (sender.frameId != null) target.frameIds = [sender.frameId];
+
+  const [result] = await chrome.scripting.executeScript({
+    target,
+    world: "MAIN",
+    func: (args) => {
+      const [
+        cntntsYearSeCd,
+        cntntsSeCd,
+        lctreActplnId,
+        turnId,
+        sbjectId,
+        cntntsAr,
+        cntntsHg,
+        downloadYn,
+        downGubun
+      ] = args;
+
+      const hostWindow = window.parent && window.parent !== window ? window.parent : window;
+      const hostDocument = hostWindow.document || document;
+      const frm = hostDocument.form1 || hostDocument.querySelector("form[name='form1'], #form1");
+      if (!frm) return { ok: false, reason: "form1_not_found" };
+
+      const valueOf = (name, fallback = "") => {
+        const field = frm.elements && frm.elements[name];
+        return field && field.value != null ? field.value : fallback;
+      };
+
+      const mobileYn = Boolean(hostWindow.mobileYn);
+      const CP_MAIN_NAVI_PATH = "/study/navi/elrnNaviNextMain.do";
+      let CP_NAVI_PATH = "";
+      if (mobileYn) {
+        CP_NAVI_PATH = "/study/navi/mobiVideo.do";
+      } else if (cntntsYearSeCd === "1") {
+        CP_NAVI_PATH = "/study/navi/elrnVideo.do";
+      } else {
+        CP_NAVI_PATH = "/study/navi/elrnVideo.do";
+      }
+
+      if (cntntsSeCd === "2") return { ok: false, reason: "unsupported_content_type" };
+
+      const nextTurn = turnId || valueOf("contProgInfoV", "01");
+      const bottomPage = valueOf("bottomPage", "0");
+      const leftPosition = valueOf("leftPosition", "0");
+      let url = `${CP_NAVI_PATH}?turnId=${encodeURIComponent(nextTurn)}&bottomPage=${encodeURIComponent(bottomPage)}&leftPosition=${encodeURIComponent(leftPosition)}`;
+      if (lctreActplnId) url += `&lctreActplnId=${encodeURIComponent(lctreActplnId)}`;
+      if (downloadYn) url += `&downloadYn=${encodeURIComponent(downloadYn)}`;
+      if (downGubun) url += `&downGubun=${encodeURIComponent(downGubun)}`;
+
+      const titleNode = hostDocument.querySelector(".sec1 h1.tit, h1.tit");
+      const sbjectNm = (titleNode ? titleNode.innerText : hostDocument.title || "").trim();
+      url += `&sbjectNm=${encodeURI(encodeURIComponent(sbjectNm))}&sbjectId=${encodeURIComponent(sbjectId || "")}`;
+
+      const width = Number(cntntsAr) || screen.availWidth || 1200;
+      const height = Number(cntntsHg) || screen.availHeight || 800;
+      return {
+        ok: true,
+        url: new URL(`${CP_MAIN_NAVI_PATH}?${url}`, location.origin).href,
+        width,
+        height
+      };
+    },
+    args: [parsed.args]
+  });
+
+  const data = result && result.result;
+  if (!data || !data.ok || !data.url) return { opened: false, reason: data?.reason || "url_build_failed" };
+
+  const popup = await chrome.windows.create({
+    url: data.url,
+    type: "popup",
+    width: Math.min(Math.max(Math.floor(data.width), 640), 1920),
+    height: Math.min(Math.max(Math.floor(data.height), 480), 1080)
+  });
+
+  popupTrackers.set(sender.tab.id, {
+    knownTabIds: new Set(),
+    knownWindowIds: new Set(),
+    popupTabId: popup.tabs && popup.tabs[0] ? popup.tabs[0].id : null,
+    popupWindowId: popup.id,
+    startedAt: Date.now()
+  });
+
+  return {
+    opened: true,
+    popup: {
+      windowId: popup.id,
+      tabId: popup.tabs && popup.tabs[0] ? popup.tabs[0].id : null
+    }
+  };
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   setState(defaultState);
+  allowTargetPopups();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -400,7 +865,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       if (message.type === "START") {
-        await startAutomation();
+        await startAutomation(sender.tab || null);
         sendResponse({ ok: true, state: await getState() });
         return;
       }
@@ -428,6 +893,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       if (message.type === "RUN_PAGE_ONCLICK") {
         sendResponse({ ok: true, ...(await runPageOnclick(sender, message.onclick)) });
+        return;
+      }
+      if (message.type === "CLEAR_PAGE_POPUP_HANDLE") {
+        sendResponse({ ok: true, ...(await clearPagePopupHandle(sender)) });
+        return;
+      }
+      if (message.type === "DISPATCH_MOUSE_CLICK") {
+        sendResponse({ ok: true, ...(await dispatchMouseClick(sender, message.point)) });
+        return;
+      }
+      if (message.type === "OPEN_LESSON_WITH_TRUSTED_CLICK") {
+        sendResponse({ ok: true, ...(await openLessonWithTrustedClick(sender, message.onclick)) });
+        return;
+      }
+      if (message.type === "OPEN_LEARNING_POPUP") {
+        sendResponse({ ok: true, ...(await openLearningPopup(sender, message.onclick)) });
         return;
       }
       sendResponse({ ok: false, error: "unknown_message" });

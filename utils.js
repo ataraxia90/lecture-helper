@@ -35,6 +35,13 @@
     return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
   }
 
+  function formatIndexedLabel(label, index, total) {
+    const text = label || "-";
+    const current = Number(index) || 0;
+    const max = Number(total) || 0;
+    return max > 0 ? `${text} (${current}/${max})` : text;
+  }
+
   function computeRemainingTime(completed, total) {
     return Math.max(0, Math.floor((Number(total) || 0) - (Number(completed) || 0)));
   }
@@ -73,6 +80,7 @@
   globalThis.LectureHelperUtils = {
     parseDuration,
     formatDuration,
+    formatIndexedLabel,
     computeRemainingTime,
     sleep,
     isTargetUrl,

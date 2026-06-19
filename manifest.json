@@ -3,7 +3,7 @@
   "name": "Lecture Helper",
   "description": "Target-site lecture attendance helper that opens unfinished lesson popups for the remaining required time.",
   "version": "1.0.0",
-  "permissions": ["storage", "tabs", "windows", "scripting", "debugger"],
+  "permissions": ["storage", "tabs", "windows", "scripting", "debugger", "contentSettings"],
   "host_permissions": ["https://moip.nhi.go.kr/*"],
   "action": {
     "default_popup": "popup.html",

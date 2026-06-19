@@ -5,9 +5,13 @@
 
     ROW_SELECTORS: [
       ".study_group .list_area .list_clear:has(.progress)",
+      ".study_group .list_area .list.clear:has(.progress)",
       ".study_group .list_area .list_clear",
+      ".study_group .list_area .list.clear",
       ".list_area .list_clear",
+      ".list_area .list.clear",
       ".list_clear",
+      ".list.clear",
       "[data-lecture-row]",
       ".lecture-row",
       ".lesson-row",
@@ -20,6 +24,8 @@
       ".subject a",
       ".subject button",
       ".subject",
+      "a[onclick*='checkRtprgs']",
+      "button[onclick*='checkRtprgs']",
       "[data-lecture-title]",
       ".lecture-title",
       ".lesson-title",

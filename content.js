@@ -11,22 +11,87 @@
   const processedLessonKeys = new Set();
   const processedLessonIndexes = new Set();
 
+  function isExtensionContextError(error) {
+    return /extension context invalidated|context invalidated|receiving end does not exist/i.test(String(error && (error.message || error)));
+  }
+
   function sendRuntimeMessage(message) {
-    return chrome.runtime.sendMessage(message);
+    try {
+      if (!chrome.runtime || !chrome.runtime.id) {
+        return Promise.resolve({ ok: false, contextInvalidated: true });
+      }
+      return chrome.runtime.sendMessage(message).catch((error) => {
+        if (isExtensionContextError(error)) {
+          stopRequested = true;
+          automationRunning = false;
+          return { ok: false, contextInvalidated: true };
+        }
+        throw error;
+      });
+    } catch (error) {
+      if (isExtensionContextError(error)) {
+        stopRequested = true;
+        automationRunning = false;
+        return Promise.resolve({ ok: false, contextInvalidated: true });
+      }
+      return Promise.reject(error);
+    }
   }
 
   async function sendStatusUpdate(patch) {
-    await sendRuntimeMessage({ type: "STATUS_UPDATE", patch });
+    const response = await sendRuntimeMessage({ type: "STATUS_UPDATE", patch });
+    return !(response && response.contextInvalidated);
   }
 
   function formatPanelDuration(seconds) {
     return Utils.formatDuration(seconds || 0);
   }
 
+  function decodeRepeated(value) {
+    let decoded = String(value || "").replace(/\+/g, " ");
+    for (let index = 0; index < 3; index += 1) {
+      try {
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      } catch (_error) {
+        break;
+      }
+    }
+    return decoded;
+  }
+
+  function cleanCourseTitle(title) {
+    return String(title || "")
+      .replace(/\[(?:mobile|Mobile)\s*겸용\]\s*/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 160);
+  }
+
+  function getCourseTitleFromUrl(urlText = location.href) {
+    const raw = String(urlText || "").match(/[?&]sbjectNm=([^&#]+)/)?.[1];
+    if (!raw) return "";
+    return cleanCourseTitle(decodeRepeated(raw));
+  }
+
+  function getVisibleCourseTitleFallback() {
+    return (
+      getCourseTitleFromUrl()
+      || document.querySelector("body > h1, .top h1, .header h1, .navi-title")?.innerText
+      || document.querySelector(".sec1 h1.tit, h1.tit")?.innerText
+      || document.title.split(":").pop()
+      || ""
+    ).trim().slice(0, 160);
+  }
+
   function renderFloatingPanel(root, state) {
     const safe = state || {};
+    const urlCourseTitle = getCourseTitleFromUrl();
+    const courseTitle = urlCourseTitle || (safe.courseTitle && safe.courseTitle !== "-" ? safe.courseTitle : getVisibleCourseTitleFallback());
     root.querySelector("[data-lh-status]").textContent = safe.status || "idle";
-    root.querySelector("[data-lh-title]").textContent = safe.currentTitle || "-";
+    root.querySelector("[data-lh-course]").textContent = Utils.formatIndexedLabel(courseTitle, safe.courseIndex, safe.courseTotal);
+    root.querySelector("[data-lh-title]").textContent = Utils.formatIndexedLabel(safe.currentTitle, safe.lessonIndex, safe.lessonTotal);
     root.querySelector("[data-lh-completed]").textContent = formatPanelDuration(safe.completedTime);
     root.querySelector("[data-lh-total]").textContent = formatPanelDuration(safe.totalTime);
     root.querySelector("[data-lh-remaining]").textContent = formatPanelDuration(safe.remainingTime);
@@ -146,6 +211,10 @@
         <button type="button" data-lh-stop>Stop</button>
       </div>
       <div class="lh-current">
+        <span class="lh-label">강의명</span>
+        <span data-lh-course>-</span>
+      </div>
+      <div class="lh-current">
         <span class="lh-label">차시명</span>
         <span data-lh-title>-</span>
       </div>
@@ -164,10 +233,14 @@
     document.body.appendChild(panel);
 
     panel.querySelector("[data-lh-start]").addEventListener("click", () => {
-      sendRuntimeMessage({ type: "START" });
+      sendRuntimeMessage({ type: "START" }).catch((error) => {
+        if (!isExtensionContextError(error)) throw error;
+      });
     });
     panel.querySelector("[data-lh-stop]").addEventListener("click", () => {
-      sendRuntimeMessage({ type: "STOP" });
+      sendRuntimeMessage({ type: "STOP" }).catch((error) => {
+        if (!isExtensionContextError(error)) throw error;
+      });
     });
 
     chrome.storage.onChanged.addListener((changes, area) => {
@@ -280,6 +353,7 @@
   function isLectureRow(row) {
     const title = getTitleElement(row);
     const titleText = title ? visibleText(title).trim() : "";
+    if (!title) return false;
     if (title && isIgnoredTitleText(titleText)) return false;
     if (!row.querySelector(".progress, .current, .total")) return false;
     return true;
@@ -294,22 +368,22 @@
         const text = searchableText(node);
         const timeCount = Utils.extractDurationCandidates(text).length;
         if (hasTime && timeCount > 0) {
-          const titleLike = node.querySelector("a[onclick*='checkTrRng'], button[onclick*='checkTrRng'], .subject a");
+          const titleLike = node.querySelector("a[onclick*='checkTrRng'], button[onclick*='checkTrRng'], a[onclick*='checkRtprgs'], button[onclick*='checkRtprgs'], .subject a");
           if (titleLike) return node;
           if (!fallback && (timeCount >= 2 || node.querySelector(".progress"))) fallback = node;
         }
       }
       node = node.parentElement;
     }
-    return fallback || element.closest(".list_clear, li, tr, div");
+    return fallback || element.closest(".list_clear, .list.clear, li, tr, div");
   }
 
   function findRows() {
     const titleRows = [];
     for (const doc of getSearchDocuments()) {
-      for (const title of doc.querySelectorAll(".study_group .list_area .subject a")) {
+      for (const title of doc.querySelectorAll(".study_group .list_area .subject a, a[onclick*='checkRtprgs']")) {
         if (isIgnoredTitleText(visibleText(title))) continue;
-        const row = title.closest(".list_clear");
+        const row = title.closest(".list_clear, .list.clear");
         if (row && isLectureRow(row)) titleRows.push(row);
       }
     }
@@ -364,7 +438,7 @@
   }
 
   function getClickableLessonElement(row) {
-    const checked = row.querySelector("a[onclick*='checkTrRng'], button[onclick*='checkTrRng']");
+    const checked = row.querySelector("a[onclick*='checkTrRng'], button[onclick*='checkTrRng'], a[onclick*='checkRtprgs'], button[onclick*='checkRtprgs']");
     if (checked) return checked;
 
     const titleClickable = row.querySelector(".subject a, .subject button, .title a, .title button");
@@ -397,8 +471,14 @@
 
     let node = row;
     for (let depth = 0; node && depth < 6; depth += 1) {
-      const areaText = visibleText(node).slice(0, 400);
-      if (CONFIG.COURSE_EXCLUDE_KEYWORDS.some((keyword) => areaText.includes(keyword))) return true;
+      const areaName = [
+        node.id || "",
+        node.className || "",
+        node.getAttribute?.("aria-label") || "",
+        node.getAttribute?.("data-area") || "",
+        node.getAttribute?.("data-section") || ""
+      ].join(" ");
+      if (/recommend|suggest|favorite|wish|interest|cart|apply|enrol|enroll/i.test(areaName)) return true;
       node = node.parentElement;
     }
     return false;
@@ -432,6 +512,30 @@
   function getCourseTitleText(row) {
     const title = getCourseTitleElement(row);
     return (title ? visibleText(title) : visibleText(row)).trim().slice(0, 160);
+  }
+
+  function getCourseKey(row) {
+    const openElement = getCourseOpenElement(row);
+    const onclick = openElement?.getAttribute("onclick") || openElement?.closest("[onclick]")?.getAttribute("onclick") || "";
+    const view = onclick.match(/onViewPage\s*\(\s*'([^']+)'\s*,\s*'([^']+)'/);
+    if (view) return `${view[1]}:${view[2]}`;
+    const href = openElement?.getAttribute("href") || "";
+    return `${getCourseTitleText(row)}:${onclick || href || searchableText(row).slice(0, 80)}`;
+  }
+
+  async function ensureCourseQueue(courseRows) {
+    const response = await sendRuntimeMessage({ type: "GET_STATE" });
+    const storedQueue = response && response.ok && Array.isArray(response.state?.courseQueue)
+      ? response.state.courseQueue
+      : [];
+    if (storedQueue.length > 0) return storedQueue;
+
+    const queue = courseRows.map((row) => ({
+      key: getCourseKey(row),
+      title: getCourseTitleText(row)
+    }));
+    await sendStatusUpdate({ courseQueue: queue });
+    return queue;
   }
 
   function getCourseOpenElement(row) {
@@ -501,7 +605,22 @@
     return findCourseRows().find((row) => isCourseIncomplete(row)) || null;
   }
 
-  async function openCourseDetail(row) {
+  async function findNextIncompleteCourseInfo() {
+    const rows = findCourseRows();
+    const index = rows.findIndex((row) => isCourseIncomplete(row));
+    if (index < 0) return null;
+    const queue = await ensureCourseQueue(rows);
+    const key = getCourseKey(rows[index]);
+    const queueIndex = queue.findIndex((item) => item && item.key === key);
+    return {
+      row: rows[index],
+      index: queueIndex >= 0 ? queueIndex : index,
+      total: queue.length || rows.length,
+      title: getCourseTitleText(rows[index])
+    };
+  }
+
+  async function openCourseDetail(row, courseInfo = null) {
     const target = getCourseOpenElement(row);
     if (!target) throw new Error("Course detail link was not found.");
     if (isDeniedCourseOpenElement(target)) throw new Error("Course detail link looked like enrollment/recommendation action; skipped.");
@@ -512,6 +631,11 @@
       status: "opening_popup",
       running: true,
       currentTitle: title || "Opening course detail",
+      courseTitle: courseInfo?.title || title || "",
+      courseIndex: courseInfo ? courseInfo.index + 1 : 0,
+      courseTotal: courseInfo ? courseInfo.total : 0,
+      lessonIndex: 0,
+      lessonTotal: 0,
       completedTime: 0,
       totalTime: 0,
       remainingTime: 0,
@@ -527,8 +651,190 @@
     }
   }
 
+  function getCourseDetailStartElement() {
+    const candidates = queryAll(document, [
+      "a[onclick*='onStartNavi']",
+      "button[onclick*='onStartNavi']",
+      "a.item2",
+      "button.item2"
+    ]);
+    return candidates.find((element) => {
+      if (element.closest("#lecture-helper-panel")) return false;
+      const text = visibleText(element).replace(/\s+/g, "");
+      const onclick = element.getAttribute("onclick") || "";
+      return onclick.includes("onStartNavi") || text.includes("학습시작") || text.includes("학습하기");
+    }) || null;
+  }
+
+  function extractCourseDetailLearningState() {
+    const bodyText = searchableText(document.body);
+    const title = (
+      document.querySelector(".sec1 h1.tit, h1.tit")?.innerText
+      || document.title.match(/학습현황\s*:\s*(.+)$/)?.[1]
+      || document.title
+      || "Course detail"
+    ).trim().slice(0, 160);
+
+    const graphTimeText = document.querySelector(".graph_group .result .item2")?.innerText || "";
+    const detailTimeText = Array.from(document.querySelectorAll(".info_group li"))
+      .find((item) => visibleText(item).replace(/\s+/g, "").startsWith("학습시간"))
+      ?.querySelector(".result")?.innerText || "";
+    const exactTimeText = Array.from(document.querySelectorAll(".remodal li, .mdtxt li"))
+      .find((item) => visibleText(item).replace(/\s+/g, "").startsWith("학습시간"))
+      ?.querySelector(".color10, .bold")?.innerText || "";
+    const learnedMatch = bodyText.match(/학습시간\s*:?\s*([0-9]+\s*시(?:간)?\s*)?([0-9]+\s*분)\s*([0-9]+\s*초)?/);
+    const compactLearnedMatch = (exactTimeText || detailTimeText || graphTimeText).match(/([0-9]+\s*시(?:간)?\s*)?([0-9]+\s*분)\s*([0-9]+\s*초)?/);
+    const creditTimeText = Array.from(document.querySelectorAll(".info_area span, .ly_right span"))
+      .map((element) => visibleText(element))
+      .find((text) => text.includes("인정시간")) || "";
+    const creditMatch = creditTimeText.match(/인정시간\s*:?\s*([0-9]+\s*시(?:간)?\s*)?([0-9]+\s*분)\s*([0-9]+\s*초)?/)
+      || bodyText.match(/인정시간\s*:?\s*([0-9]+\s*시(?:간)?\s*)?([0-9]+\s*분)\s*([0-9]+\s*초)?/);
+    const requiredMatch = bodyText.match(/필수학습시간\s*:?\s*([0-9]+\s*시(?:간)?\s*)?([0-9]+\s*분)\s*([0-9]+\s*초)?/);
+
+    const completed = compactLearnedMatch
+      ? Utils.parseDuration(compactLearnedMatch[0])
+      : (learnedMatch ? Utils.parseDuration(learnedMatch[0]) : null);
+    const total = creditMatch
+      ? Utils.parseDuration(creditMatch[0])
+      : (requiredMatch ? Utils.parseDuration(requiredMatch[0]) : null);
+    const remaining = completed != null && total != null ? Utils.computeRemainingTime(completed, total) : 0;
+
+    return {
+      title,
+      completed: completed || 0,
+      total: total || 0,
+      remaining
+    };
+  }
+
+  function getCurrentCourseTitle() {
+    return (
+      getCourseTitleFromUrl()
+      || document.querySelector("body > h1, .top h1, .header h1, .navi-title")?.innerText
+      ||
+      document.querySelector(".sec1 h1.tit, h1.tit")?.innerText
+      || document.title.match(/학습현황\s*:\s*(.+)$/)?.[1]
+      || ""
+    ).trim().slice(0, 160);
+  }
+
+  function getCurrentCourseTitleFromAnyFrame() {
+    const docs = [document];
+    try {
+      if (window.parent && window.parent !== window && window.parent.document) docs.push(window.parent.document);
+    } catch (_error) {
+      // Other hosts may not allow parent-frame access.
+    }
+
+    for (const doc of docs) {
+      const title = (
+        getCourseTitleFromUrl(doc.location?.href || location.href)
+        || doc.querySelector("body > h1, .top h1, .header h1, .navi-title")?.innerText
+        ||
+        doc.querySelector(".sec1 h1.tit, h1.tit")?.innerText
+        || doc.title.split(":").pop()
+        || ""
+      ).trim().slice(0, 160);
+      if (title) return title;
+    }
+
+    return getCurrentCourseTitle();
+  }
+
+  async function runCourseDetailPage() {
+    const startElement = getCourseDetailStartElement();
+    if (!startElement) return false;
+
+    const state = extractCourseDetailLearningState();
+    await sendStatusUpdate({
+      status: "opening_popup",
+      running: true,
+      currentTitle: state.title,
+      courseTitle: state.title,
+      completedTime: state.completed,
+      totalTime: state.total,
+      remainingTime: state.remaining,
+      lastError: ""
+    });
+
+    startElement.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+    await Utils.sleep(150);
+
+    const onclick = startElement.getAttribute("onclick") || startElement.closest("[onclick]")?.getAttribute("onclick") || "";
+    await sendRuntimeMessage({ type: "PREPARE_POPUP_TRACKING" });
+    if (/onStartNavi\s*\(/.test(onclick)) {
+      try {
+        window.contWin = null;
+      } catch (_error) {
+        // Ignore stale page popup handles.
+      }
+      await sendRuntimeMessage({ type: "CLEAR_PAGE_POPUP_HANDLE" });
+      const clicked = await trustedClickElement(startElement);
+      if (!clicked) {
+        const response = await sendRuntimeMessage({ type: "RUN_PAGE_ONCLICK", onclick });
+        if (!response || !response.ok || !response.executed) startElement.click();
+      }
+    } else if (onclick) {
+      const response = await sendRuntimeMessage({ type: "RUN_PAGE_ONCLICK", onclick });
+      if (!response || !response.ok || !response.executed) startElement.click();
+    } else {
+      startElement.click();
+    }
+
+    const popupResponse = await sendRuntimeMessage({ type: "WAIT_FOR_POPUP" });
+    if (!popupResponse || !popupResponse.ok || !popupResponse.popup) {
+      await sendStatusUpdate({
+        lastError: `${state.title}: learning popup was not detected.`
+      });
+      return true;
+    }
+
+    const waitMs = state.remaining > 0
+      ? state.remaining * 1000 + CONFIG.SAFETY_BUFFER_MS
+      : CONFIG.SAFETY_BUFFER_MS;
+    const completedWait = await waitForRemainingTime(waitMs, () => stopRequested, {
+      completedTime: state.completed,
+      totalTime: state.total
+    });
+    await sendRuntimeMessage({ type: "CLOSE_TRACKED_POPUP" });
+
+    await sendStatusUpdate({
+      status: completedWait && !stopRequested ? "idle" : "stopped",
+      running: false,
+      remainingTime: 0,
+      lastError: completedWait ? "Course detail learning popup was processed." : ""
+    });
+    return true;
+  }
+
+  async function closeCourseDetailToList() {
+    await sendStatusUpdate({
+      status: "returning_to_course_list",
+      running: true,
+      currentTitle: "",
+      lessonIndex: 0,
+      lessonTotal: 0,
+      remainingTime: 0,
+      lastError: "Current course has no pending lessons. Returning to course list."
+    });
+
+    await Utils.sleep(150);
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.location.assign("/myspace/myroom/myHomeStudyList.do");
+      } else {
+        window.location.assign("/myspace/myroom/myHomeStudyList.do");
+      }
+    } catch (_error) {
+      window.location.assign("/myspace/myroom/myHomeStudyList.do");
+    }
+    return true;
+  }
+
   async function autoResumeIfRunning() {
     if (!CONFIG.AUTO_RESUME_RUNNING) return;
+    if (window.top !== window) return;
+    if (/\/study\/navi\/|elrnVideo\.do/i.test(location.href)) return;
     await Utils.sleep(1000);
     try {
       const response = await sendRuntimeMessage({ type: "GET_STATE" });
@@ -640,14 +946,30 @@
     if (!title) throw new Error("Clickable title element was not found.");
     title.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
     await Utils.sleep(150);
-    await sendRuntimeMessage({ type: "PREPARE_POPUP_TRACKING" });
 
     const onclick = title.getAttribute("onclick") || title.closest("[onclick]")?.getAttribute("onclick") || "";
-    if (/checkTrRng\s*\(/.test(onclick)) {
-      const response = await sendRuntimeMessage({ type: "RUN_PAGE_ONCLICK", onclick });
-      if (!response || !response.ok || !response.executed) title.click();
+    if (/checkTrRng\s*\(|checkRtprgs\s*\(|onStartNavi\s*\(/.test(onclick)) {
+      try {
+        if (window.parent && window.parent !== window) window.parent.contWin = null;
+        else window.contWin = null;
+      } catch (_error) {
+        // Ignore frame access issues; the background handler also attempts cleanup.
+      }
+      await sendRuntimeMessage({ type: "CLEAR_PAGE_POPUP_HANDLE" });
+    }
+    await sendRuntimeMessage({ type: "PREPARE_POPUP_TRACKING" });
+    if (/checkTrRng\s*\(|checkRtprgs\s*\(|onStartNavi\s*\(/.test(onclick)) {
+      const trustedResponse = await sendRuntimeMessage({ type: "OPEN_LESSON_WITH_TRUSTED_CLICK", onclick });
+      if (trustedResponse && trustedResponse.ok && trustedResponse.popup) return trustedResponse;
+
+      const clicked = await trustedClickElement(title);
+      if (!clicked) {
+        const response = await sendRuntimeMessage({ type: "RUN_PAGE_ONCLICK", onclick });
+        if (!response || !response.ok || !response.executed) title.click();
+      }
     } else if (row.contains(title) && isLectureRow(row)) {
-      title.click();
+      const clicked = await trustedClickElement(title);
+      if (!clicked) title.click();
     } else {
       throw new Error(`Refused to click non-lesson link: ${visibleText(title).trim().slice(0, 80) || "untitled"}`);
     }
@@ -655,14 +977,54 @@
     return sendRuntimeMessage({ type: "WAIT_FOR_POPUP" });
   }
 
-  async function waitForRemainingTime(ms, stopSignal) {
+  function getViewportClickPoint(element) {
+    let rect = element.getBoundingClientRect();
+    let x = rect.left + rect.width / 2;
+    let y = rect.top + rect.height / 2;
+    let win = window;
+
+    while (win.parent && win.parent !== win) {
+      try {
+        const frame = win.frameElement;
+        if (!frame) break;
+        rect = frame.getBoundingClientRect();
+        x += rect.left;
+        y += rect.top;
+        win = win.parent;
+      } catch (_error) {
+        break;
+      }
+    }
+
+    return { x, y };
+  }
+
+  async function trustedClickElement(element) {
+    const point = getViewportClickPoint(element);
+    const response = await sendRuntimeMessage({ type: "DISPATCH_MOUSE_CLICK", point });
+    return Boolean(response && response.ok && response.clicked);
+  }
+
+  async function waitForRemainingTime(ms, stopSignal, progress = null) {
     const deadline = Date.now() + ms;
+    const startedAt = Date.now();
+    const baseCompleted = Math.max(0, progress?.completedTime || 0);
+    const totalTime = Math.max(0, progress?.totalTime || 0);
     while (Date.now() < deadline) {
       if (stopSignal()) return false;
       const leftMs = Math.max(0, deadline - Date.now());
+      const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+      const displayedCompleted = totalTime > 0
+        ? Math.min(totalTime, baseCompleted + elapsedSeconds)
+        : baseCompleted + elapsedSeconds;
+      const displayedRemaining = totalTime > 0
+        ? Math.max(0, totalTime - displayedCompleted)
+        : Math.ceil(leftMs / 1000);
       await sendStatusUpdate({
         status: "waiting",
-        remainingTime: Math.ceil(leftMs / 1000)
+        completedTime: displayedCompleted,
+        totalTime: totalTime || progress?.totalTime || 0,
+        remainingTime: displayedRemaining
       });
       await Utils.sleep(Math.min(CONFIG.STATUS_POLL_INTERVAL, leftMs));
     }
@@ -710,6 +1072,8 @@
       await sendStatusUpdate({
         status: "hovering",
         currentTitle: title,
+        lessonIndex: index + 1,
+        lessonTotal: rows.length,
         completedTime: completed,
         totalTime: 0,
         remainingTime: 0,
@@ -726,14 +1090,17 @@
       const remaining = Utils.computeRemainingTime(completed, total);
       await sendStatusUpdate({
         status: "running",
+        courseTitle: getCurrentCourseTitleFromAnyFrame(),
         currentTitle: title,
+        lessonIndex: index + 1,
+        lessonTotal: rows.length,
         completedTime: completed,
         totalTime: total,
         remainingTime: remaining
       });
 
       if (remaining > 0 && !rowHasCompletedKeyword(row)) {
-        return { row, index, title, completed, total, remaining, lessonKey };
+        return { row, index, totalRows: rows.length, title, completed, total, remaining, lessonKey };
       }
 
       stats.alreadyComplete += 1;
@@ -742,6 +1109,7 @@
     await sendStatusUpdate({
       lastError: `No pending lesson: rows=${stats.rows}, missingCompleted=${stats.missingCompleted}, missingTotal=${stats.missingTotal}, completeOrZero=${stats.alreadyComplete}${stats.firstMissingCompleted ? `, sample=${stats.firstMissingCompleted}` : ""}`
     });
+    await closeCourseDetailToList();
     return null;
   }
 
@@ -749,7 +1117,10 @@
     if (automationRunning) return;
     const initialRows = findRows();
     if (initialRows.length === 0) {
-      const pendingCourse = findNextIncompleteCourse();
+      const handledCourseDetail = await runCourseDetailPage();
+      if (handledCourseDetail) return;
+
+      const pendingCourse = await findNextIncompleteCourseInfo();
       if (pendingCourse) {
         automationRunning = true;
         stopRequested = false;
@@ -757,9 +1128,14 @@
           await sendStatusUpdate({
             status: "running",
             running: true,
-            lastError: `Course rows=${findCourseRows().length}`
+            courseTitle: pendingCourse.title,
+            courseIndex: pendingCourse.index + 1,
+            courseTotal: pendingCourse.total,
+            lessonIndex: 0,
+            lessonTotal: 0,
+            lastError: `Course rows=${pendingCourse.total}`
           });
-          await openCourseDetail(pendingCourse);
+          await openCourseDetail(pendingCourse.row, pendingCourse);
         } catch (error) {
           await sendStatusUpdate({
             status: "error",
@@ -769,7 +1145,17 @@
         } finally {
           automationRunning = false;
         }
+        return;
       }
+      await sendStatusUpdate({
+        status: "idle",
+        running: false,
+        currentTitle: "No pending lesson",
+        completedTime: 0,
+        totalTime: 0,
+        remainingTime: 0,
+        lastError: `No lesson or incomplete course rows found on this page.`
+      });
       return;
     }
     automationRunning = true;
@@ -781,16 +1167,23 @@
       await sendStatusUpdate({
         status: "running",
         running: true,
+        courseTitle: getCurrentCourseTitleFromAnyFrame(),
         lastError: `Initial rows=${initialRows.length}`
       });
 
       while (!stopRequested) {
         const pending = await findNextPendingRow();
-        if (!pending) break;
+        if (!pending) {
+          await closeCourseDetailToList();
+          return;
+        }
 
         await sendStatusUpdate({
           status: "opening_popup",
+          courseTitle: getCurrentCourseTitleFromAnyFrame(),
           currentTitle: pending.title,
+          lessonIndex: pending.index + 1,
+          lessonTotal: pending.totalRows,
           completedTime: pending.completed,
           totalTime: pending.total,
           remainingTime: pending.remaining
@@ -804,9 +1197,13 @@
         }
 
         const waitMs = pending.remaining * 1000 + CONFIG.SAFETY_BUFFER_MS;
-        const completedWait = await waitForRemainingTime(waitMs, () => stopRequested);
+        const completedWait = await waitForRemainingTime(waitMs, () => stopRequested, {
+          completedTime: pending.completed,
+          totalTime: pending.total
+        });
 
         await sendRuntimeMessage({ type: "CLOSE_TRACKED_POPUP" });
+        await sendRuntimeMessage({ type: "CLEAR_PAGE_POPUP_HANDLE" });
         if (!completedWait || stopRequested) break;
 
         await sendStatusUpdate({ status: "verifying", remainingTime: 0 });
@@ -818,6 +1215,10 @@
           verifyCompletion(rowForVerify),
           Utils.sleep(Math.max(CONFIG.VERIFY_WAIT_MS + 5000, 8000))
         ]);
+      }
+
+      if (!stopRequested && await closeCourseDetailToList()) {
+        return;
       }
 
       await sendStatusUpdate({
